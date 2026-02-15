@@ -581,6 +581,113 @@ func (i *Instance) QueryLabelValues(ctx context.Context, query *metadata.Query, 
 	return lbs, err
 }
 
+// QuerySeries 查询时间序列的唯一标签组合
+//
+// 该函数用于查询指定时间范围内的所有唯一标签组合（时间序列），
+// 主要用于数据探索和标签维度分析场景。
+//
+// 参数:
+//   - ctx: 上下文，用于追踪和超时控制
+//   - query: 查询配置，包含数据库、表名、字段等元数据
+//   - start: 查询开始时间
+//   - end: 查询结束时间
+//
+// 返回值:
+//   - []map[string]string: 唯一标签组合列表，每个map代表一个时间序列的标签键值对
+//   - error: 错误信息，成功时为nil
+//
+// 功能说明:
+//  1. 验证查询参数的有效性
+//  2. 获取字段映射关系
+//  3. 过滤内部维度和特殊字段
+//  4. 构建DISTINCT查询SQL获取唯一标签组合
+//  5. 执行查询并格式化返回结果
+//  6. 处理字段编码和空值情况
+func (i *Instance) QuerySeries(ctx context.Context, query *metadata.Query, start, end time.Time) ([]map[string]string, error) {
+	var err error
+
+	ctx, span := trace.NewSpan(ctx, "bk-sql-query-series")
+	defer span.End(&err)
+
+	queryFactory, err := i.InitQueryFactory(ctx, query, start, end)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(query.Source) == 0 {
+		err = fmt.Errorf("no source specified")
+		return nil, err
+	}
+
+	fieldMap, err := i.QueryFieldMap(ctx, query, start, end)
+	if err != nil {
+		return nil, err
+	}
+
+	var labelNames []string
+	for _, k := range query.Source {
+		if checkInternalDimension(k) {
+			continue
+		}
+		if k == sql_expr.TimeStamp || k == sql_expr.Value {
+			continue
+		}
+		labelNames = append(labelNames, k)
+	}
+
+	span.Set("field-map", fieldMap)
+	span.Set("label-names", labelNames)
+
+	if len(labelNames) == 0 {
+		return nil, nil
+	}
+
+	// 设置 SelectDistinct 以获取唯一标签组合
+	query.SelectDistinct = labelNames
+	defer func() {
+		query.SelectDistinct = nil
+	}()
+
+	distinctSQL, err := queryFactory.SQL()
+	if err != nil {
+		return nil, err
+	}
+
+	distinctData, err := i.sqlQuery(ctx, distinctSQL)
+	if err != nil {
+		return nil, err
+	}
+
+	encodeFunc := metadata.GetFieldFormat(ctx).EncodeFunc()
+
+	series := make([]map[string]string, 0, len(distinctData.List))
+	for _, d := range distinctData.List {
+		seriesMap := make(map[string]string)
+		for _, name := range labelNames {
+			encodedName := name
+			if encodeFunc != nil {
+				encodedName = encodeFunc(name)
+			}
+
+			value, valErr := getValue(encodedName, d)
+			if valErr != nil {
+				// 字段不存在时视为空值（NULL），不返回错误
+				continue
+			}
+
+			if value != "" {
+				seriesMap[name] = value
+			}
+		}
+
+		if len(seriesMap) > 0 {
+			series = append(series, seriesMap)
+		}
+	}
+
+	span.Set("series-count", len(series))
+	return series, nil
+}
 func (i *Instance) InstanceType() string {
 	return metadata.BkSqlStorageType
 }
