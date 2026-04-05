@@ -305,8 +305,6 @@ func TestBkData_SQL_ToFinalSQL(t *testing.T) {
 		wantSQL string
 	}{
 		{
-			// doris 表：Measurement="doris"，表名为 `db`.doris
-			// 用户 SQL 的 SELECT/WHERE 被解析后，时间范围条件以 AND (...) 形式追加
 			name: "doris with user sql",
 			query: &Query{
 				DataSource:    BkData,
@@ -318,8 +316,6 @@ func TestBkData_SQL_ToFinalSQL(t *testing.T) {
 			wantSQL: "SELECT NULL AS dtEventTimeStamp, NULL AS gseIndex FROM `2_bklog_unit_test`.doris WHERE NULL > 0 AND (`dtEventTimeStamp` >= 1741795260000 AND `dtEventTimeStamp` <= 1741796260000 AND `dtEventTime` >= '2025-03-13 00:01:00' AND `dtEventTime` <= '2025-03-13 00:17:41' AND `thedate` = '20250313') LIMIT 20",
 		},
 		{
-			// tspider 表：Measurement="" 单段 table_id，表名无后缀
-			// NewQueryFactory 检测到 SQL 非空 + BkSqlStorageType + Measurement="" 时选用 TSpiderSQLExpr
 			name: "tspider (no measurement) with user sql",
 			query: &Query{
 				DataSource:    BkData,
@@ -331,7 +327,6 @@ func TestBkData_SQL_ToFinalSQL(t *testing.T) {
 			wantSQL: "SELECT NULL AS dtEventTimeStamp, NULL AS gseIndex FROM `2_bklog_unit_test` WHERE NULL > 0 AND (`dtEventTimeStamp` >= 1741795260000 AND `dtEventTimeStamp` <= 1741796260000 AND `dtEventTime` >= '2025-03-13 00:01:00' AND `dtEventTime` <= '2025-03-13 00:17:41' AND `thedate` = '20250313') LIMIT 20",
 		},
 		{
-			// 无用户 SQL：走 buildSQL 路径，SELECT 中包含内置字段 _value_ / _timestamp_
 			name: "doris without user sql (buildSQL path)",
 			query: &Query{
 				DataSource:    BkData,
@@ -343,7 +338,6 @@ func TestBkData_SQL_ToFinalSQL(t *testing.T) {
 			wantSQL: "SELECT *, NULL AS `_value_`, `dtEventTimeStamp` AS `_timestamp_` FROM `2_bklog_unit_test`.doris WHERE `dtEventTimeStamp` >= 1741795260000 AND `dtEventTimeStamp` <= 1741796260000 AND `dtEventTime` >= '2025-03-13 00:01:00' AND `dtEventTime` <= '2025-03-13 00:17:41' AND `thedate` = '20250313' LIMIT 10",
 		},
 		{
-			// 用户自定义 SQL 仅聚合（count），仍追加时间窗口（与带 SELECT 列表的 user sql 一致）
 			name: "tspider (no measurement) with user sql count(*)",
 			query: &Query{
 				DataSource:    BkData,
@@ -355,7 +349,6 @@ func TestBkData_SQL_ToFinalSQL(t *testing.T) {
 			wantSQL: "SELECT count(*) FROM `2_bklog_unit_test` WHERE (`dtEventTimeStamp` >= 1741795260000 AND `dtEventTimeStamp` <= 1741796260000 AND `dtEventTime` >= '2025-03-13 00:01:00' AND `dtEventTime` <= '2025-03-13 00:17:41' AND `thedate` = '20250313') LIMIT 1",
 		},
 		{
-			// Doris：反引号库表 + count，时间条件以 AND 追加
 			name: "doris with user sql count(*)",
 			query: &Query{
 				DataSource:    BkData,
@@ -379,6 +372,60 @@ func TestBkData_SQL_ToFinalSQL(t *testing.T) {
 			assert.Equal(t, tc.wantSQL, gotSQL)
 		})
 	}
+}
+
+// TestBkData_ToQueryMetric_PropagatesSQLToBkSqlStage 验证 bkdata 分支把结构化请求中的 sql 等字段写入 metadata.Query，
+// 且 bksql.QueryFactory.SQL() 在用户 SQL 非空时走 parserSQL，使用同一条模板参与生成。
+func TestBkData_ToQueryMetric_PropagatesSQLToBkSqlStage(t *testing.T) {
+	mock.Init()
+	ctx := md.InitHashID(context.Background())
+	influxdb.MockSpaceRouter(ctx)
+
+	wantSQL := "SELECT dtEventTimeStamp FROM `2_bklog_unit_test`.doris WHERE dtEventTimeStamp > 0 LIMIT 10"
+	q := &Query{
+		DataSource:    BkData,
+		TableID:       "2_bklog_unit_test.doris",
+		FieldName:     "gseIndex",
+		ReferenceName: "a",
+		SQL:           wantSQL,
+		QueryString:   "level:ERROR",
+		IsPrefix:      true,
+		KeepColumns:   KeepColumns{"log", "level"},
+		Limit:         20,
+		From:          5,
+		Scroll:        "scroll-token",
+		DryRun:        true,
+		IsMergeDB:     true,
+		OrderBy:       OrderBy{"-dtEventTimeStamp"},
+	}
+
+	metric, err := q.ToQueryMetric(ctx, influxdb.SpaceUid, nil)
+	require.NoError(t, err)
+	require.Len(t, metric.QueryList, 1)
+
+	mq := metric.QueryList[0]
+	assert.Equal(t, wantSQL, mq.SQL)
+	assert.Equal(t, "level:ERROR", mq.QueryString)
+	assert.True(t, mq.IsPrefix)
+	assert.Equal(t, []string{"log", "level"}, mq.Source)
+	assert.Equal(t, 20, mq.Size)
+	assert.Equal(t, 5, mq.From)
+	assert.Equal(t, "scroll-token", mq.Scroll)
+	assert.True(t, mq.DryRun)
+	assert.True(t, mq.IsMergeDB)
+	assert.Equal(t, md.BkSqlStorageType, mq.StorageType)
+	assert.Equal(t, "2_bklog_unit_test", mq.DB)
+	assert.Equal(t, "doris", mq.Measurement)
+	require.Len(t, mq.Orders, 1)
+	assert.Equal(t, "dtEventTimeStamp", mq.Orders[0].Name)
+	assert.False(t, mq.Orders[0].Ast)
+
+	start := time.Unix(1741795260, 0)
+	end := time.Unix(1741796260, 0)
+	gotSQL, err := bksql.NewQueryFactory(ctx, mq).WithRangeTime(start, end).SQL()
+	require.NoError(t, err)
+	assert.NotEmpty(t, gotSQL)
+	assert.Contains(t, gotSQL, "dtEventTimeStamp")
 }
 
 // TestE2E_Query_TableIDConditions_ToQueryMetric_GetTsDBList 端到端：Query 带 TableIDConditions → ToQueryMetric(tsDBs=nil) → GetTsDBList 选表，链路打通；mock 下无匹配 Labels 时 QueryList 为空
