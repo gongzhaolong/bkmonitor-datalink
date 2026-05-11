@@ -514,12 +514,10 @@ func HandlerLabelValues(c *gin.Context) {
 
 	ctx, span := trace.NewSpan(ctx, "label-values-handler")
 	defer func() {
+		span.End(&err)
 		if err != nil {
 			resp.failed(ctx, err)
-			return
 		}
-
-		span.End(&err)
 	}()
 
 	labelName := c.Param("label_name")
@@ -670,8 +668,6 @@ func HandlerFieldMap(c *gin.Context) {
 				return
 			}
 
-			span.Set(fmt.Sprintf("field-map-length-%s", qry.TableUUID()), len(res))
-
 			for k, v := range res {
 				lock.Lock()
 				if _, ok := dataMap[k]; !ok {
@@ -712,13 +708,14 @@ func infoParamsToQueryRef(ctx context.Context, params *Params) (queryRef metadat
 		SpaceUid: user.SpaceUID,
 		QueryList: []*structured.Query{
 			{
-				DataSource:    params.DataSource,
-				TableID:       params.TableID,
-				FieldName:     params.Metric,
-				IsRegexp:      params.IsRegexp,
-				Conditions:    params.Conditions,
-				Limit:         params.Limit,
-				ReferenceName: metadata.DefaultReferenceName,
+				DataSource:        params.DataSource,
+				TableID:           params.TableID,
+				FieldName:         params.Metric,
+				IsRegexp:          params.IsRegexp,
+				Conditions:        params.Conditions,
+				TableIDConditions: params.TableIDConditions,
+				Limit:             params.Limit,
+				ReferenceName:     metadata.DefaultReferenceName,
 			},
 		},
 		MetricMerge: metadata.DefaultReferenceName,
