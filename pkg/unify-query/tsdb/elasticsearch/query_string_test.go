@@ -87,10 +87,19 @@ func TestQsToDsl(t *testing.T) {
 			FieldName: "__ext.labels.app_kubernetes_io_instance",
 			FieldType: KeyWord,
 		},
+		"__ext.container_name": {
+			FieldName: "__ext.container_name",
+			FieldType: KeyWord,
+		},
+		"__ext.bk_bcs_cluster_id": {
+			FieldName: "__ext.bk_bcs_cluster_id",
+			FieldType: KeyWord,
+		},
 	}
 
 	ctx := metadata.InitHashID(context.Background())
 	for i, c := range []struct {
+		name     string
 		q        string
 		expected string
 		err      error
@@ -118,6 +127,16 @@ func TestQsToDsl(t *testing.T) {
 		{
 			q:        `__ext.labels.app_kubernetes_io_instance : bcs-cluster-manager AND log: GSE Agent 安装失败* AND log: InstallGSEAgentTask*`,
 			expected: `{"bool":{"must":[{"term":{"__ext.labels.app_kubernetes_io_instance":"bcs-cluster-manager"}},{"match_phrase":{"log":{"query":"GSE"}}},{"wildcard":{"log":{"value":"installgseagenttask*"}}},{"query_string":{"analyze_wildcard":true,"fields":["*","__*"],"lenient":true,"query":"Agent"}},{"query_string":{"analyze_wildcard":true,"fields":["*","__*"],"lenient":true,"query":"安装失败*"}}]}}`,
+		},
+		{
+			name:     "unquoted escaped keyword value",
+			q:        `__ext.container_name: bk\-log\-search\-api`,
+			expected: `{"term":{"__ext.container_name":"bk-log-search-api"}}`,
+		},
+		{
+			name:     "production query with unquoted escaped keyword value",
+			q:        `log: "\"pathname\": \"/app/venv/lib64" AND __ext.bk_bcs_cluster_id: BCS* AND __ext.container_name: bk\-log\-search\-api`,
+			expected: `{"bool":{"must":[{"match_phrase":{"log":{"query":"pathname\": \"/app/venv/lib64"}}},{"wildcard":{"__ext.bk_bcs_cluster_id":{"value":"BCS*"}}},{"term":{"__ext.container_name":"bk-log-search-api"}}]}}`,
 		},
 		{
 			q:        `sync_spaces AND -keyword AND -BKLOGAPI`,
@@ -208,7 +227,11 @@ func TestQsToDsl(t *testing.T) {
 			expected: `{"exists":{"field":"events.attributes.message.detail"}}`,
 		},
 	} {
-		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+		name := c.name
+		if name == "" {
+			name = fmt.Sprintf("%d", i)
+		}
+		t.Run(name, func(t *testing.T) {
 			ctx = metadata.InitHashID(ctx)
 			node := lucene_parser.ParseLuceneWithVisitor(ctx, c.q, lucene_parser.Option{
 				FieldsMap: testMapping,
@@ -226,6 +249,53 @@ func TestQsToDsl(t *testing.T) {
 			} else {
 				t.Logf("Query: %s, ES result: %v", c.q, node != nil)
 			}
+		})
+	}
+}
+
+func TestParserQueryStringMappingAvailability(t *testing.T) {
+	mock.Init()
+	ctx := metadata.InitHashID(context.Background())
+
+	for name, tc := range map[string]struct {
+		fieldsMap metadata.FieldsMap
+		expected  string
+	}{
+		"missing mapping falls back to native query string": {
+			fieldsMap: metadata.FieldsMap{},
+			expected:  `{"query_string":{"analyze_wildcard":true,"fields":["*","__*"],"lenient":true,"query":"NOT (message:\"ignored phrase\")"}}`,
+		},
+		"known text field keeps match phrase": {
+			fieldsMap: metadata.FieldsMap{
+				"message": {
+					FieldName:  "message",
+					FieldType:  Text,
+					IsAnalyzed: true,
+				},
+			},
+			expected: `{"bool":{"must_not":{"match_phrase":{"message":{"query":"ignored phrase"}}}}}`,
+		},
+		"known keyword field keeps term": {
+			fieldsMap: metadata.FieldsMap{
+				"message": {
+					FieldName: "message",
+					FieldType: KeyWord,
+				},
+			},
+			expected: `{"bool":{"must_not":{"term":{"message":"ignored phrase"}}}}`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			query := NewFormatFactory(ctx).
+				WithFieldMap(tc.fieldsMap).
+				ParserQueryString(ctx, `NOT (message:"ignored phrase")`, false)
+			require.NotNil(t, query)
+			body, err := query.Source()
+			require.NoError(t, err)
+
+			bodyJSON, err := json.Marshal(body)
+			require.NoError(t, err)
+			assert.JSONEq(t, tc.expected, string(bodyJSON))
 		})
 	}
 }
